@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -271,7 +273,7 @@ class WorldModel(nn.Module):
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def encode_obs(self, obs):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type=obs.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
@@ -279,7 +281,7 @@ class WorldModel(nn.Module):
         return flattened_sample
 
     def calc_last_dist_feat(self, latent, action):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type=latent.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             temporal_mask = get_subsequent_mask(latent)
             dist_feat = self.storm_transformer(latent, action, temporal_mask)
             last_dist_feat = dist_feat[:, -1:]
@@ -289,7 +291,7 @@ class WorldModel(nn.Module):
         return prior_flattened_sample, last_dist_feat
 
     def predict_next(self, last_flattened_sample, action, log_video=True):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type=last_flattened_sample.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
             prior_logits = self.dist_head.forward_prior(dist_feat)
 
@@ -320,7 +322,7 @@ class WorldModel(nn.Module):
     def flatten_sample(self, sample):
         return rearrange(sample, "B L K C -> B L (K C)")
 
-    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype):
+    def init_imagine_buffer(self, imagine_batch_size, imagine_batch_length, dtype, device):
         '''
         This can slightly improve the efficiency of imagine_data
         But may vary across different machines
@@ -332,18 +334,18 @@ class WorldModel(nn.Module):
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
             hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
-            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device="cuda")
-            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device="cuda")
-            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
-            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
+            self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
+            self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
+            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, log_video, logger):
-        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype)
+                     imagine_batch_size, imagine_batch_length, log_video, logger, device="cuda"):
+        self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=device)
         obs_hat_list = []
 
-        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype)
+        self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
         # context
         context_latent = self.encode_obs(sample_obs)
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
@@ -379,7 +381,7 @@ class WorldModel(nn.Module):
         self.train()
         batch_size, batch_length = obs.shape[:2]
 
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+        with torch.autocast(device_type=obs.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             # encoding
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
@@ -415,6 +417,20 @@ class WorldModel(nn.Module):
         self.optimizer.zero_grad(set_to_none=True)
 
         if logger is not None:
+            # Categorical latent utilisation: how many of the C categories the
+            # posterior actually uses per group (collapse diagnostic). Computed
+            # from the empirical frequencies of the sampled one-hot codes over
+            # the batch; perplexity is the effective #categories used (out of
+            # stoch_dim, 1 = collapsed), and usage is the same as normalised
+            # entropy in [0, 1] (1 = uniform).
+            with torch.no_grad():
+                avg_probs = sample.detach().float().mean(dim=(0, 1))  # (K, C)
+                num_categories = avg_probs.shape[-1]
+                group_entropy = -(avg_probs * (avg_probs + 1e-8).log()).sum(dim=-1)
+                categorical_perplexity = group_entropy.exp().mean()
+                categorical_usage = (group_entropy / math.log(num_categories)).mean()
+            logger.log("WorldModel/categorical_perplexity", categorical_perplexity.item())
+            logger.log("WorldModel/categorical_usage", categorical_usage.item())
             logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item())
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/termination_loss", termination_loss.item())
