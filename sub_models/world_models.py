@@ -228,6 +228,11 @@ class WorldModel(nn.Module):
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
 
+        # Baseline method: EWC (Elastic Weight Consolidation)
+        # Initialise EWC-related attributes.
+        self.ewc = None
+        self.ewc_enabled = False
+
         self.encoder = EncoderBN(
             in_channels=in_channels,
             stem_channels=32,
@@ -377,10 +382,23 @@ class WorldModel(nn.Module):
 
         return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
-    def update(self, obs, action, reward, termination, logger=None):
-        self.train()
-        batch_size, batch_length = obs.shape[:2]
+    def compute_loss(self, obs, action, reward, termination):
+        """
+        Compute the total STORM world model loss.
+        Copy-pasted and made into a function from the original STORM implementation enabling calling from other functions.
 
+        Args:
+            obs: Observations tensor of shape (batch_size, batch_length, channels, height, width).
+            action: Actions tensor of shape (batch_size, batch_length).
+            reward: Rewards tensor of shape (batch_size, batch_length).
+            termination: Termination flags tensor of shape (batch_size, batch_length).
+
+        Returns:
+            total_loss: The total loss combining reconstruction, reward, termination, dynamics, and representation losses.
+            sample: The sampled latent representation from the posterior distribution.
+            loss_dict: A dictionary containing individual loss components for logging purposes.
+        """
+        batch_size, batch_length = obs.shape[:2]
         with torch.autocast(device_type=obs.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             # encoding
             embedding = self.encoder(obs)
@@ -408,6 +426,31 @@ class WorldModel(nn.Module):
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
             total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
 
+        loss_dict = {
+            "reconstruction_loss": reconstruction_loss.item(),
+            "reward_loss": reward_loss.item(),
+            "termination_loss": termination_loss.item(),
+            "dynamics_loss": dynamics_loss.item(),
+            "dynamics_real_kl_div": dynamics_real_kl_div.item(),
+            "representation_loss": representation_loss.item(),
+            "representation_real_kl_div": representation_real_kl_div.item()
+        }
+
+        return total_loss, sample, loss_dict
+
+    def update(self, obs, action, reward, termination, logger=None):
+        self.train()
+
+        # vanilla STORM loss compute
+        total_loss, sample, loss_dict = self.compute_loss(obs, action, reward, termination)
+
+        # Baseline method: EWC (Elastic Weight Consolidation)
+        # If EWC is enabled, compute the EWC loss and add it to the total loss for regularisation
+        if self.ewc_enabled and self.ewc is not None:
+            ewc_loss = self.ewc.compute_ewc_loss()
+            total_loss = total_loss + ewc_loss
+            loss_dict["ewc_loss"] = ewc_loss.item()
+
         # gradient descent
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
@@ -431,11 +474,6 @@ class WorldModel(nn.Module):
                 categorical_usage = (group_entropy / math.log(num_categories)).mean()
             logger.log("WorldModel/categorical_perplexity", categorical_perplexity.item())
             logger.log("WorldModel/categorical_usage", categorical_usage.item())
-            logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item())
-            logger.log("WorldModel/reward_loss", reward_loss.item())
-            logger.log("WorldModel/termination_loss", termination_loss.item())
-            logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
-            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
-            logger.log("WorldModel/representation_loss", representation_loss.item())
-            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
             logger.log("WorldModel/total_loss", total_loss.item())
+            for key, value in loss_dict.items():
+                logger.log(f"WorldModel/{key}", value)
