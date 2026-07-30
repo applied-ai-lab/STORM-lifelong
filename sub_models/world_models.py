@@ -232,6 +232,9 @@ class WorldModel(nn.Module):
         # Initialise EWC-related attributes.
         self.ewc = None
         self.ewc_enabled = False
+        # Baseline method: PackNet
+        self.packnet = None
+        self.packnet_enabled = False
 
         self.encoder = EncoderBN(
             in_channels=in_channels,
@@ -454,6 +457,11 @@ class WorldModel(nn.Module):
         # gradient descent
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
+
+        # Baseline method: PackNet
+        if self.packnet_enabled and self.packnet is not None:
+            self.packnet.mask_gradients() # Mask everything that is not part of the current task
+
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
         self.scaler.step(self.optimizer)
         self.scaler.update()
