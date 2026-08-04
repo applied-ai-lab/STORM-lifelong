@@ -175,3 +175,10 @@ class ActorCriticAgent(nn.Module):
             logger.log('ActorCritic/S', S.item())
             logger.log('ActorCritic/norm_ratio', norm_ratio.item())
             logger.log('ActorCritic/total_loss', loss.item())
+            # Imagined-return diagnostics: what the policy *thinks* it earns in the
+            # dream, to compare against real-env return (sample/* and eval/*). High
+            # imagined return with low real return = objective mismatch: the agent
+            # is exploiting an inaccurate world model rather than solving the task.
+            logger.log('ActorCritic/imagined_return', lambda_return.mean().item())
+            logger.log('ActorCritic/imagined_reward_mean', reward.mean().item())
+            logger.log('ActorCritic/imagined_termination_frac', termination.float().mean().item())
