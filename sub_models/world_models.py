@@ -341,7 +341,8 @@ class WorldModel(nn.Module):
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, log_video, logger, device="cuda"):
+                     imagine_batch_size, imagine_batch_length, log_video, logger, device="cuda",
+                     step=None):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype, device=device)
         obs_hat_list = []
 
@@ -373,11 +374,11 @@ class WorldModel(nn.Module):
                 obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
 
         if log_video:
-            logger.log("Imagine/predict_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
+            logger.log("Imagine/predict_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy(), step=step)
 
         return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
-    def update(self, obs, action, reward, termination, logger=None):
+    def update(self, obs, action, reward, termination, logger=None, step=None):
         self.train()
         batch_size, batch_length = obs.shape[:2]
 
@@ -429,13 +430,13 @@ class WorldModel(nn.Module):
                 group_entropy = -(avg_probs * (avg_probs + 1e-8).log()).sum(dim=-1)
                 categorical_perplexity = group_entropy.exp().mean()
                 categorical_usage = (group_entropy / math.log(num_categories)).mean()
-            logger.log("WorldModel/categorical_perplexity", categorical_perplexity.item())
-            logger.log("WorldModel/categorical_usage", categorical_usage.item())
-            logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item())
-            logger.log("WorldModel/reward_loss", reward_loss.item())
-            logger.log("WorldModel/termination_loss", termination_loss.item())
-            logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
-            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item())
-            logger.log("WorldModel/representation_loss", representation_loss.item())
-            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
-            logger.log("WorldModel/total_loss", total_loss.item())
+            logger.log("WorldModel/categorical_perplexity", categorical_perplexity.item(), step=step)
+            logger.log("WorldModel/categorical_usage", categorical_usage.item(), step=step)
+            logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item(), step=step)
+            logger.log("WorldModel/reward_loss", reward_loss.item(), step=step)
+            logger.log("WorldModel/termination_loss", termination_loss.item(), step=step)
+            logger.log("WorldModel/dynamics_loss", dynamics_loss.item(), step=step)
+            logger.log("WorldModel/dynamics_real_kl_div", dynamics_real_kl_div.item(), step=step)
+            logger.log("WorldModel/representation_loss", representation_loss.item(), step=step)
+            logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item(), step=step)
+            logger.log("WorldModel/total_loss", total_loss.item(), step=step)

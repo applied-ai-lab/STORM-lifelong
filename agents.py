@@ -126,7 +126,8 @@ class ActorCriticAgent(nn.Module):
         action = self.sample(latent, greedy)
         return action.detach().cpu().squeeze(-1).numpy()
 
-    def update(self, latent, action, old_logprob, old_value, reward, termination, logger=None, device="cuda"):
+    def update(self, latent, action, old_logprob, old_value, reward, termination, logger=None, device="cuda",
+               step=None):
         '''
         Update policy and value model
         '''
@@ -169,16 +170,16 @@ class ActorCriticAgent(nn.Module):
         self.update_slow_critic()
 
         if logger is not None:
-            logger.log('ActorCritic/policy_loss', policy_loss.item())
-            logger.log('ActorCritic/value_loss', value_loss.item())
-            logger.log('ActorCritic/entropy_loss', entropy_loss.item())
-            logger.log('ActorCritic/S', S.item())
-            logger.log('ActorCritic/norm_ratio', norm_ratio.item())
-            logger.log('ActorCritic/total_loss', loss.item())
+            logger.log('ActorCritic/policy_loss', policy_loss.item(), step=step)
+            logger.log('ActorCritic/value_loss', value_loss.item(), step=step)
+            logger.log('ActorCritic/entropy_loss', entropy_loss.item(), step=step)
+            logger.log('ActorCritic/S', S.item(), step=step)
+            logger.log('ActorCritic/norm_ratio', norm_ratio.item(), step=step)
+            logger.log('ActorCritic/total_loss', loss.item(), step=step)
             # Imagined-return diagnostics: what the policy *thinks* it earns in the
             # dream, to compare against real-env return (sample/* and eval/*). High
             # imagined return with low real return = objective mismatch: the agent
             # is exploiting an inaccurate world model rather than solving the task.
-            logger.log('ActorCritic/imagined_return', lambda_return.mean().item())
-            logger.log('ActorCritic/imagined_reward_mean', reward.mean().item())
-            logger.log('ActorCritic/imagined_termination_frac', termination.float().mean().item())
+            logger.log('ActorCritic/imagined_return', lambda_return.mean().item(), step=step)
+            logger.log('ActorCritic/imagined_reward_mean', reward.mean().item(), step=step)
+            logger.log('ActorCritic/imagined_termination_frac', termination.float().mean().item(), step=step)

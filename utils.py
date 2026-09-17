@@ -27,19 +27,20 @@ class Logger():
         self.writer = SummaryWriter(logdir=path, flush_secs=1)
         self.tag_step = {}
 
-    def log(self, tag, value):
+    def log(self, tag, value, step=None):
         if tag not in self.tag_step:
             self.tag_step[tag] = 0
         else:
             self.tag_step[tag] += 1
+        iteration = self.tag_step[tag] if step is None else int(step)
         if "video" in tag:
-            self.writer.add_video(tag, value, self.tag_step[tag], fps=15)
+            self.writer.add_video(tag, value, iteration, fps=15)
         elif "images" in tag:
-            self.writer.add_images(tag, value, self.tag_step[tag])
+            self.writer.add_images(tag, value, iteration)
         elif "hist" in tag:
-            self.writer.add_histogram(tag, value, self.tag_step[tag])
+            self.writer.add_histogram(tag, value, iteration)
         else:
-            self.writer.add_scalar(tag, value, self.tag_step[tag])
+            self.writer.add_scalar(tag, value, iteration)
 
 
 class EMAScalar():
