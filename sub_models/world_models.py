@@ -327,6 +327,15 @@ class WorldModel(nn.Module):
             sample = dist.probs
         return sample
 
+    def predict_next_backbone(self, latent, action):
+        """Recorded-action evaluation without reward/termination decoder calls."""
+        with torch.autocast(device_type=latent.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
+            features = self.storm_transformer.forward_with_kv_cache(latent, action)
+            logits = self.dist_head.forward_prior(features)
+            next_latent = self.flatten_sample(self.stright_throught_gradient(logits))
+            image = self.image_decoder(next_latent)
+        return image, next_latent
+
     def flatten_sample(self, sample):
         return rearrange(sample, "B L K C -> B L (K C)")
 
@@ -402,7 +411,24 @@ class WorldModel(nn.Module):
             sample: The sampled latent representation from the posterior distribution.
             loss_dict: A dictionary containing individual loss components for logging purposes.
         """
-        batch_size, batch_length = obs.shape[:2]
+        components, sample = self.compute_loss_components(obs, action, reward, termination)
+        total_loss, loss_dict = self.combine_loss_components(components)
+        return total_loss, sample, {name: value.item() for name, value in loss_dict.items()}
+
+    def compute_loss_components(self, obs, action, reward=None, termination=None,
+                                backbone=True, heads=True):
+        """Differentiable losses, with genuinely optional decoder forwards.
+
+        Historical ER batches request backbone=True, heads=False. Recent-head
+        batches still backpropagate through posterior samples and the transformer.
+        Raw KL means are returned before the free-bits floor for source pooling.
+        """
+        if not backbone and not heads:
+            raise ValueError("At least one loss group must be requested")
+        if heads and (reward is None or termination is None):
+            raise ValueError("Head losses require reward and termination targets")
+        batch_length = obs.shape[1]
+        components = {}
         with torch.autocast(device_type=obs.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             # encoding
             embedding = self.encoder(obs)
@@ -411,36 +437,73 @@ class WorldModel(nn.Module):
             flattened_sample = self.flatten_sample(sample)
 
             # decoding image
-            obs_hat = self.image_decoder(flattened_sample)
+            if backbone:
+                obs_hat = self.image_decoder(flattened_sample)
 
             # transformer
             temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
             dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask)
-            prior_logits = self.dist_head.forward_prior(dist_feat)
+            if backbone:
+                prior_logits = self.dist_head.forward_prior(dist_feat)
             # decoding reward and termination with dist_feat
-            reward_hat = self.reward_decoder(dist_feat)
-            termination_hat = self.termination_decoder(dist_feat)
+            if heads:
+                reward_hat = self.reward_decoder(dist_feat)
+                termination_hat = self.termination_decoder(dist_feat)
 
             # env loss
-            reconstruction_loss = self.mse_loss_func(obs_hat, obs)
-            reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
-            termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
-            # dyn-rep loss
-            dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
-            representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
-            total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+            if backbone:
+                components["reconstruction_loss"] = self.mse_loss_func(obs_hat, obs)
+                _, components["dynamics_real_kl_div"] = self.categorical_kl_div_loss(
+                    post_logits[:, 1:].detach(), prior_logits[:, :-1])
+                _, components["representation_real_kl_div"] = self.categorical_kl_div_loss(
+                    post_logits[:, 1:], prior_logits[:, :-1].detach())
+            if heads:
+                components["reward_loss"] = self.symlog_twohot_loss_func(reward_hat, reward)
+                components["termination_loss"] = self.bce_with_logits_loss_func(termination_hat, termination)
 
-        loss_dict = {
-            "reconstruction_loss": reconstruction_loss.item(),
-            "reward_loss": reward_loss.item(),
-            "termination_loss": termination_loss.item(),
-            "dynamics_loss": dynamics_loss.item(),
-            "dynamics_real_kl_div": dynamics_real_kl_div.item(),
-            "representation_loss": representation_loss.item(),
-            "representation_real_kl_div": representation_real_kl_div.item()
-        }
+        return components, sample
 
-        return total_loss, sample, loss_dict
+    def combine_loss_components(self, components):
+        """Apply STORM's coefficients and free bits after any source pooling."""
+        losses = dict(components)
+        free_bits = self.categorical_kl_div_loss.free_bits
+        for name in ("dynamics", "representation"):
+            raw = components[f"{name}_real_kl_div"]
+            losses[f"{name}_loss"] = torch.maximum(torch.ones_like(raw) * free_bits, raw)
+        total = (losses["reconstruction_loss"] + losses["reward_loss"]
+                 + losses["termination_loss"] + 0.5 * losses["dynamics_loss"]
+                 + 0.1 * losses["representation_loss"])
+        return total, losses
+
+    def compute_er_loss(self, recent_batch, replay_batch, mode):
+        """One recent forward then one head-free replay forward in every mode."""
+        if mode not in ("reservoir_fifo", "fifo_only", "reservoir_only"):
+            raise ValueError(f"Unknown ER mode: {mode}")
+        if recent_batch[0].shape[1] != replay_batch.obs.shape[1]:
+            raise ValueError("ER recent and replay sequence lengths must match")
+        recent, sample = self.compute_loss_components(
+            *recent_batch, backbone=mode == "reservoir_fifo", heads=True)
+        replay, _ = self.compute_loss_components(
+            replay_batch.obs, replay_batch.action, backbone=True, heads=False)
+
+        combined = dict(recent)
+        weight = recent_batch[0].shape[0] / (recent_batch[0].shape[0] + replay_batch.obs.shape[0])
+        for name in replay:
+            combined[name] = (weight * recent[name] + (1 - weight) * replay[name]
+                              if mode == "reservoir_fifo" else replay[name])
+        total, losses = self.combine_loss_components(combined)
+        # Detach only for diagnostics, after forming the differentiable objective.
+        logs = {name: value.detach() for name, value in losses.items()}
+        logs.update({f"er_recent/{name}": value.detach() for name, value in recent.items()})
+        logs.update({f"er_replay/{name}": value.detach() for name, value in replay.items()})
+        return total, sample, logs
+
+    def update_er(self, recent_batch, replay_batch, mode, logger=None, step=None):
+        if self.ewc_enabled or self.packnet_enabled:
+            raise ValueError("ER cannot be combined with EWC or PackNet")
+        self.train()
+        total_loss, sample, loss_dict = self.compute_er_loss(recent_batch, replay_batch, mode)
+        self._apply_update(total_loss, sample, loss_dict, logger, step)
 
     def update(self, obs, action, reward, termination, logger=None, step=None):
         self.train()
@@ -455,6 +518,10 @@ class WorldModel(nn.Module):
             total_loss = total_loss + ewc_loss
             loss_dict["ewc_loss"] = ewc_loss.item()
 
+        self._apply_update(total_loss, sample, loss_dict, logger, step)
+
+    def _apply_update(self, total_loss, sample, loss_dict, logger=None, step=None):
+        """Shared single optimiser/scaler step for ordinary STORM and ER."""
         # gradient descent
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
@@ -485,4 +552,4 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/categorical_usage", categorical_usage.item(), step=step)
             logger.log("WorldModel/total_loss", total_loss.item(), step=step)
             for key, value in loss_dict.items():
-                logger.log(f"WorldModel/{key}", value, step=step)
+                logger.log(f"WorldModel/{key}", value.item() if torch.is_tensor(value) else value, step=step)
