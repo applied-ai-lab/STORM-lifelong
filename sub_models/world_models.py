@@ -225,6 +225,10 @@ class WorldModel(nn.Module):
         self.stoch_flattened_dim = self.stoch_dim*self.stoch_dim
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        # What the model consumes from a posterior or prior wherever it would draw a sample
+        # (transformer input, decoder input, agent input, imagination): "sample" = STORM's
+        # straight-through one-hot sample; "probs" = the class probabilities themselves.
+        self.latent_input = "sample"
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
 
@@ -318,6 +322,8 @@ class WorldModel(nn.Module):
         return obs_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat
 
     def stright_throught_gradient(self, logits, sample_mode="random_sample"):
+        if sample_mode == "random_sample" and getattr(self, "latent_input", "sample") == "probs":
+            sample_mode = "probs"   # see latent_input in __init__
         dist = OneHotCategorical(logits=logits)
         if sample_mode == "random_sample":
             sample = dist.sample() + dist.probs - dist.probs.detach()
