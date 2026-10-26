@@ -217,9 +217,14 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
 
 class WorldModel(nn.Module):
     def __init__(self, in_channels, action_dim,
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads):
+                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads,
+                 action_kind="discrete"):
         super().__init__()
         self.transformer_hidden_dim = transformer_hidden_dim
+        # "discrete" (integer actions, one-hot into the transformer) or "continuous"
+        # (float vectors of size action_dim); see sub_models.transformer_model.encode_action.
+        self.action_kind = action_kind
+        self.action_dim = action_dim
         self.final_feature_width = 4
         self.stoch_dim = 32
         self.stoch_flattened_dim = self.stoch_dim*self.stoch_dim
@@ -252,7 +257,8 @@ class WorldModel(nn.Module):
             num_layers=transformer_num_layers,
             num_heads=transformer_num_heads,
             max_length=transformer_max_length,
-            dropout=0.1
+            dropout=0.1,
+            action_kind=action_kind,
         )
         self.dist_head = DistHead(
             image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
@@ -357,9 +363,12 @@ class WorldModel(nn.Module):
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
             hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
+            action_size = scalar_size if self.action_kind == "discrete" else (*scalar_size, self.action_dim)
             self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device=device)
             self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device=device)
-            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
+            # Continuous actions in float32: the actor scores these exact raw samples.
+            action_dtype = dtype if self.action_kind == "discrete" else torch.float32
+            self.action_buffer = torch.zeros(action_size, dtype=action_dtype, device=device)
             self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device=device)
 
