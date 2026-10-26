@@ -8,16 +8,19 @@ import pickle
 
 
 class ReplayBuffer():
-    def __init__(self, obs_shape, num_envs, max_length=int(1E6), warmup_length=50000, store_on_gpu=False) -> None:
+    def __init__(self, obs_shape, num_envs, max_length=int(1E6), warmup_length=50000, store_on_gpu=False,
+                 action_shape=()) -> None:
+        # action_shape: () for discrete (one integer per step), (A,) for continuous actions.
         self.store_on_gpu = store_on_gpu
+        self.action_shape = tuple(action_shape)
         if store_on_gpu:
             self.obs_buffer = torch.empty((max_length//num_envs, num_envs, *obs_shape), dtype=torch.uint8, device="cuda", requires_grad=False)
-            self.action_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
+            self.action_buffer = torch.empty((max_length//num_envs, num_envs, *self.action_shape), dtype=torch.float32, device="cuda", requires_grad=False)
             self.reward_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
             self.termination_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
         else:
             self.obs_buffer = np.empty((max_length//num_envs, num_envs, *obs_shape), dtype=np.uint8)
-            self.action_buffer = np.empty((max_length//num_envs, num_envs), dtype=np.float32)
+            self.action_buffer = np.empty((max_length//num_envs, num_envs, *self.action_shape), dtype=np.float32)
             self.reward_buffer = np.empty((max_length//num_envs, num_envs), dtype=np.float32)
             self.termination_buffer = np.empty((max_length//num_envs, num_envs), dtype=np.float32)
 

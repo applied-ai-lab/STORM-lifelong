@@ -6,10 +6,29 @@ from einops import repeat, rearrange
 from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache
 
 
+def encode_action(action, action_dim, action_kind):
+    """Stem input for an action: one-hot for discrete, the vector for continuous.
+
+    Continuous actions are clipped to the env's [-1, 1] box here: the agent's raw
+    (unclipped) imagination samples then reach the model as the action the env would
+    execute, and replayed env actions are unchanged.
+    """
+    if action_kind == "discrete":
+        return F.one_hot(action.long(), action_dim).float()
+    if action_kind == "continuous":
+        return action.float().clamp(-1.0, 1.0)
+    raise ValueError(f"Unknown action_kind: {action_kind!r}")
+
+
+
 class StochasticTransformer(nn.Module):
-    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout):
+    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout,
+                 action_kind="discrete"):
         super().__init__()
         self.action_dim = action_dim
+        # "discrete": integer actions, one-hot encoded; "continuous": a float vector of
+        # size action_dim, fed to the stem as is.
+        self.action_kind = action_kind
 
         # mix image_embedding and action
         self.stem = nn.Sequential(
@@ -28,7 +47,7 @@ class StochasticTransformer(nn.Module):
         self.head = nn.Linear(feat_dim, stoch_dim)
 
     def forward(self, samples, action, mask):
-        action = F.one_hot(action.long(), self.action_dim).float()
+        action = encode_action(action, self.action_dim, self.action_kind)
         feats = self.stem(torch.cat([samples, action], dim=-1))
         feats = self.position_encoding(feats)
         feats = self.layer_norm(feats)
@@ -41,9 +60,13 @@ class StochasticTransformer(nn.Module):
 
 
 class StochasticTransformerKVCache(nn.Module):
-    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout):
+    def __init__(self, stoch_dim, action_dim, feat_dim, num_layers, num_heads, max_length, dropout,
+                 action_kind="discrete"):
         super().__init__()
         self.action_dim = action_dim
+        # "discrete": integer actions, one-hot encoded; "continuous": a float vector of
+        # size action_dim, fed to the stem as is.
+        self.action_kind = action_kind
         self.feat_dim = feat_dim
 
         # mix image_embedding and action
@@ -64,7 +87,7 @@ class StochasticTransformerKVCache(nn.Module):
         '''
         Normal forward pass
         '''
-        action = F.one_hot(action.long(), self.action_dim).float()
+        action = encode_action(action, self.action_dim, self.action_kind)
         feats = self.stem(torch.cat([samples, action], dim=-1))
         feats = self.position_encoding(feats)
         feats = self.layer_norm(feats)
@@ -91,7 +114,7 @@ class StochasticTransformerKVCache(nn.Module):
         L, cached = samples.shape[1], self.kv_cache_list[0].shape[1]
         mask = torch.ones((1, L, cached+L), device=samples.device).tril(diagonal=cached).bool()
 
-        action = F.one_hot(action.long(), self.action_dim).float()
+        action = encode_action(action, self.action_dim, self.action_kind)
         feats = self.stem(torch.cat([samples, action], dim=-1))
         feats = self.position_encoding.forward_with_position(feats, position=self.kv_cache_list[0].shape[1])
         feats = self.layer_norm(feats)

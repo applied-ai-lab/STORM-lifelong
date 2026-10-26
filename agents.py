@@ -35,11 +35,30 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
+    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef,
+                 action_kind="discrete", min_std=0.1, max_std=1.0, clip_sample=False,
+                 policy_init_scale=0.01) -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
         self.entropy_coef = entropy_coef
+        # "discrete": a Categorical over action_dim actions (STORM). "continuous": a
+        # DreamerV3-style bounded normal over an action_dim vector in [-1, 1] -- mean
+        # tanh(mu), std in [min_std, max_std] -- trained with the same REINFORCE loss.
+        if action_kind not in ("discrete", "continuous"):
+            raise ValueError(f"Unknown action_kind: {action_kind!r}")
+        self.action_kind = action_kind
+        self.action_dim = action_dim
+        self.min_std = min_std
+        self.max_std = max_std
+        # Continuous only. The policy is scored on its RAW sample, as DreamerV3 does: the
+        # [-1, 1] clip happens where the action is executed (sample_as_env_action, and the
+        # world model's input in encode_action), so it is part of the environment and the
+        # REINFORCE gradient stays unbiased. clip_sample=True restores the earlier
+        # behaviour -- scoring the clipped action with the Gaussian density -- which
+        # biases the std gradient towards the bounds (Fujita & Maeda 2018, "Clipped
+        # Action Policy Gradient").
+        self.clip_sample = clip_sample
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
@@ -58,8 +77,14 @@ class ActorCriticAgent(nn.Module):
             ])
         self.actor = nn.Sequential(
             *actor,
-            nn.Linear(hidden_dim, action_dim)
+            nn.Linear(hidden_dim, action_dim if action_kind == "discrete" else 2 * action_dim)
         )
+        if action_kind == "continuous" and policy_init_scale != 1.0:
+            # DreamerV3's policy outscale: start near mean 0 / std ~0.9, away from where
+            # tanh (mean) and sigmoid (std) saturate. 1.0 = PyTorch's default init.
+            with torch.no_grad():
+                self.actor[-1].weight.mul_(policy_init_scale)
+                self.actor[-1].bias.zero_()
 
         critic = [
             nn.Linear(feat_dim, hidden_dim, bias=False),
@@ -94,6 +119,15 @@ class ActorCriticAgent(nn.Module):
         logits = self.actor(x)
         return logits
 
+    def action_dist(self, logits):
+        """The policy distribution for actor outputs ``logits``."""
+        if self.action_kind == "discrete":
+            return distributions.Categorical(logits=logits)
+        mean, std = logits.float().chunk(2, dim=-1)
+        mean = torch.tanh(mean)
+        std = (self.max_std - self.min_std) * torch.sigmoid(std + 2.0) + self.min_std
+        return distributions.Independent(distributions.Normal(mean, std), 1)
+
     def value(self, x):
         value = self.critic(x)
         value = self.symlog_twohot_loss.decode(value)
@@ -115,16 +149,26 @@ class ActorCriticAgent(nn.Module):
         self.eval()
         with torch.autocast(device_type=latent.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             logits = self.policy(latent)
-            dist = distributions.Categorical(logits=logits)
-            if greedy:
-                action = dist.probs.argmax(dim=-1)
+            if self.action_kind == "discrete":
+                dist = distributions.Categorical(logits=logits)
+                if greedy:
+                    action = dist.probs.argmax(dim=-1)
+                else:
+                    action = dist.sample()
             else:
-                action = dist.sample()
+                dist = self.action_dist(logits)
+                action = dist.mean if greedy else dist.sample()
+                if self.clip_sample:
+                    action = action.clamp(-1.0, 1.0)
         return action
 
     def sample_as_env_action(self, latent, greedy=False):
         action = self.sample(latent, greedy)
-        return action.detach().cpu().squeeze(-1).numpy()
+        if self.action_kind == "discrete":
+            return action.detach().cpu().squeeze(-1).numpy()
+        # (B, 1, A) -> (B, A) float32 for the vector env, clipped to its bounds: the env
+        # executes (and the replay buffer stores) the clipped action.
+        return action.detach().float().clamp(-1.0, 1.0).cpu().squeeze(1).numpy()
 
     def update(self, latent, action, old_logprob, old_value, reward, termination, logger=None, device="cuda",
                step=None):
@@ -134,8 +178,8 @@ class ActorCriticAgent(nn.Module):
         self.train()
         with torch.autocast(device_type=latent.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             logits, raw_value = self.get_logits_raw_value(latent)
-            dist = distributions.Categorical(logits=logits[:, :-1])
-            log_prob = dist.log_prob(action)
+            dist = self.action_dist(logits[:, :-1])
+            log_prob = dist.log_prob(action if self.action_kind == "discrete" else action.float())
             entropy = dist.entropy()
 
             # decode value, calc lambda return
@@ -183,3 +227,14 @@ class ActorCriticAgent(nn.Module):
             logger.log('ActorCritic/imagined_return', lambda_return.mean().item(), step=step)
             logger.log('ActorCritic/imagined_reward_mean', reward.mean().item(), step=step)
             logger.log('ActorCritic/imagined_termination_frac', termination.float().mean().item(), step=step)
+            if self.action_kind == "continuous":
+                # Is the policy pinned at a bound? std at its floor/ceiling, how saturated
+                # tanh(mean) is, and how often a raw sample falls outside [-1, 1].
+                with torch.no_grad():
+                    std = dist.base_dist.stddev
+                    band = 0.01 * (self.max_std - self.min_std)
+                    logger.log('ActorCritic/policy_std_mean', std.mean().item(), step=step)
+                    logger.log('ActorCritic/policy_std_at_floor', (std < self.min_std + band).float().mean().item(), step=step)
+                    logger.log('ActorCritic/policy_std_at_ceiling', (std > self.max_std - band).float().mean().item(), step=step)
+                    logger.log('ActorCritic/policy_abs_mean', dist.base_dist.mean.abs().mean().item(), step=step)
+                    logger.log('ActorCritic/action_clip_frac', (action.float().abs() > 1).float().mean().item(), step=step)
