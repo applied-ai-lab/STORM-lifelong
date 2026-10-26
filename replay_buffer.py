@@ -30,6 +30,29 @@ class ReplayBuffer():
         self.max_length = max_length
         self.warmup_length = warmup_length
         self.external_buffer_length = None
+        # Optional per-step side input (e.g. a memory route), stored with each step and
+        # read back for the steps the last ``sample`` drew (``last_routes``).
+        self.route_buffer = None
+        self._last_sample = None
+
+    def enable_route(self, dim):
+        """Store a (num_envs, dim) route with every appended step."""
+        n = self.max_length // self.num_envs
+        if self.store_on_gpu:
+            self.route_buffer = torch.zeros((n, self.num_envs, dim), dtype=torch.bfloat16, device="cuda")
+        else:
+            self.route_buffer = np.zeros((n, self.num_envs, dim), dtype=np.float32)
+
+    def last_routes(self, to_device="cuda"):
+        """(B, T, dim) routes of the steps the last ``sample`` returned, in the same order."""
+        if self.route_buffer is None or self._last_sample is None:
+            raise RuntimeError("last_routes needs enable_route and a preceding sample")
+        indexes_per_env, batch_length = self._last_sample
+        if self.store_on_gpu:
+            return torch.cat([torch.stack([self.route_buffer[idx:idx+batch_length, i] for idx in indexes])
+                              for i, indexes in enumerate(indexes_per_env)], dim=0)
+        return torch.from_numpy(np.concatenate([np.stack([self.route_buffer[idx:idx+batch_length, i] for idx in indexes])
+                                                for i, indexes in enumerate(indexes_per_env)], axis=0)).to(to_device)
 
     def load_trajectory(self, path):
         buffer = pickle.load(open(path, "rb"))
@@ -60,9 +83,11 @@ class ReplayBuffer():
     def sample(self, batch_size, external_batch_size, batch_length, to_device="cuda"):
         if self.store_on_gpu:
             obs, action, reward, termination = [], [], [], []
+            drawn = []
             if batch_size > 0:
                 for i in range(self.num_envs):
                     indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs)
+                    drawn.append(indexes)
                     obs.append(torch.stack([self.obs_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     action.append(torch.stack([self.action_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     reward.append(torch.stack([self.reward_buffer[idx:idx+batch_length, i] for idx in indexes]))
@@ -83,9 +108,11 @@ class ReplayBuffer():
             termination = torch.cat(termination, dim=0)
         else:
             obs, action, reward, termination = [], [], [], []
+            drawn = []
             if batch_size > 0:
                 for i in range(self.num_envs):
                     indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs)
+                    drawn.append(indexes)
                     obs.append(np.stack([self.obs_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     action.append(np.stack([self.action_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     reward.append(np.stack([self.reward_buffer[idx:idx+batch_length, i] for idx in indexes]))
@@ -105,9 +132,12 @@ class ReplayBuffer():
             reward = torch.from_numpy(np.concatenate(reward, axis=0)).to(to_device)
             termination = torch.from_numpy(np.concatenate(termination, axis=0)).to(to_device)
 
+        if self.route_buffer is not None and external_batch_size > 0 and self.external_buffer_length is not None:
+            raise RuntimeError("routes are not stored for the external buffer")
+        self._last_sample = (drawn, batch_length)
         return obs, action, reward, termination
 
-    def append(self, obs, action, reward, termination):
+    def append(self, obs, action, reward, termination, route=None):
         # obs/nex_obs: torch Tensor
         # action/reward/termination: int or float or bool
         self.last_pointer = (self.last_pointer + 1) % (self.max_length//self.num_envs)
@@ -121,6 +151,14 @@ class ReplayBuffer():
             self.action_buffer[self.last_pointer] = action
             self.reward_buffer[self.last_pointer] = reward
             self.termination_buffer[self.last_pointer] = termination
+
+        if self.route_buffer is not None:
+            if route is None:
+                raise RuntimeError("this buffer stores a route with every step")
+            if self.store_on_gpu:
+                self.route_buffer[self.last_pointer] = torch.as_tensor(route, device="cuda").to(self.route_buffer.dtype)
+            else:
+                self.route_buffer[self.last_pointer] = np.asarray(route, dtype=np.float32)
 
         if len(self) < self.max_length:
             self.length += 1
