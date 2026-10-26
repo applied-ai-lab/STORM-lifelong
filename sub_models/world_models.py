@@ -229,6 +229,17 @@ class WorldModel(nn.Module):
         # (transformer input, decoder input, agent input, imagination): "sample" = STORM's
         # straight-through one-hot sample; "probs" = the class probabilities themselves.
         self.latent_input = "sample"
+        # Encoder-routed memories (set by the memory builder): before every transformer
+        # call, hand each routed memory the encoder embedding of every token's frame --
+        # the observed frame where there is one, else the frame decoded from the token.
+        self.memory_routing = False
+        self.memory_route_kind = "frame"     # "frame" | "context" (see route_from_embedding)
+        self.memory_route_window = 16
+        self._obs_route = None
+        self._rollout_context = None
+        # Routes a caller already has for the next observed tokens (B, L, D), e.g. episode
+        # contexts stored with the replay buffer; used instead of route_from_embedding.
+        self.route_override = None
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
 
@@ -284,27 +295,87 @@ class WorldModel(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
+    def _routed_memories(self):
+        if not hasattr(self, "_routed"):
+            self._routed = [m for m in self.modules() if getattr(m, "route_dim", None) is not None]
+        return self._routed
+
+    def _routing_live(self):
+        return getattr(self, "memory_routing", False) and any(m.active for m in self._routed_memories())
+
+    def set_memory_route(self, route):
+        """Hand every routed memory its route for the next transformer call (None clears it)."""
+        for m in self._routed_memories():
+            m.route = route
+
+    @torch.no_grad()
+    def frame_route(self, flattened_sample):
+        """The route of tokens with no observed frame: the encoder embedding of the decoded frame."""
+        return self.encoder(self.image_decoder(flattened_sample).clamp(0, 1)).detach()
+
+    @torch.no_grad()
+    def route_from_embedding(self, embedding):
+        """Routes of observed tokens (B, L, D): the frame embedding itself ("frame"), or the
+        causal mean of the last ``memory_route_window`` frame embeddings ("context")."""
+        if getattr(self, "memory_route_kind", "frame") == "frame":
+            return embedding.detach()
+        x = embedding.detach().float()
+        c = torch.cat([torch.zeros_like(x[:, :1]), x.cumsum(1)], dim=1)
+        t = torch.arange(1, x.shape[1] + 1, device=x.device)
+        lo = (t - self.memory_route_window).clamp_min(0)
+        return ((c[:, t] - c[:, lo]) / (t - lo).view(1, -1, 1).to(x.dtype)).to(embedding.dtype)
+
+    def _observed_route(self, embedding):
+        """Routes of observed tokens: the caller's override when it is aligned with them, else
+        route_from_embedding."""
+        ov = getattr(self, "route_override", None)
+        if ov is not None:
+            if ov.shape[:2] != embedding.shape[:2]:
+                raise RuntimeError(f"route_override {tuple(ov.shape)} is not aligned with tokens "
+                                   f"{tuple(embedding.shape[:2])}")
+            return ov.detach().to(embedding.dtype)
+        return self.route_from_embedding(embedding)
+
+    def _unobserved_route(self, latent):
+        """Routes of tokens with no observed frame of their own: the decoded frame's embedding
+        ("frame"), or the context of the last observed frame, held fixed ("context")."""
+        if getattr(self, "memory_route_kind", "frame") == "frame":
+            return self.frame_route(latent)
+        for ctx in (self._rollout_context, None if self._obs_route is None else self._obs_route[:, -1:]):
+            if ctx is not None and ctx.shape[0] == latent.shape[0]:
+                return ctx.expand(-1, latent.shape[1], -1)
+        raise RuntimeError("context-routed memory: no observed context for these tokens")
+
     def encode_obs(self, obs):
         with torch.autocast(device_type=obs.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(obs)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             flattened_sample = self.flatten_sample(sample)
+        self._obs_route = self._observed_route(embedding) if self._routing_live() else None
         return flattened_sample
 
     def calc_last_dist_feat(self, latent, action):
         with torch.autocast(device_type=latent.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
             temporal_mask = get_subsequent_mask(latent)
+            if self._routing_live():
+                obs_route = self._obs_route
+                aligned = obs_route is not None and obs_route.shape[:2] == latent.shape[:2]
+                self.set_memory_route(obs_route if aligned else self._unobserved_route(latent))
             dist_feat = self.storm_transformer(latent, action, temporal_mask)
+            self.set_memory_route(None)
             last_dist_feat = dist_feat[:, -1:]
             prior_logits = self.dist_head.forward_prior(last_dist_feat)
             prior_sample = self.stright_throught_gradient(prior_logits, sample_mode="random_sample")
             prior_flattened_sample = self.flatten_sample(prior_sample)
         return prior_flattened_sample, last_dist_feat
 
-    def predict_next(self, last_flattened_sample, action, log_video=True):
+    def predict_next(self, last_flattened_sample, action, log_video=True, route=None):
         with torch.autocast(device_type=last_flattened_sample.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
+            if self._routing_live():
+                self.set_memory_route(route if route is not None else self._unobserved_route(last_flattened_sample))
             dist_feat = self.storm_transformer.forward_with_kv_cache(last_flattened_sample, action)
+            self.set_memory_route(None)
             prior_logits = self.dist_head.forward_prior(dist_feat)
 
             # decoding
@@ -336,7 +407,10 @@ class WorldModel(nn.Module):
     def predict_next_backbone(self, latent, action):
         """Recorded-action evaluation without reward/termination decoder calls."""
         with torch.autocast(device_type=latent.device.type, dtype=torch.bfloat16, enabled=self.use_amp):
+            if self._routing_live():
+                self.set_memory_route(self._unobserved_route(latent))
             features = self.storm_transformer.forward_with_kv_cache(latent, action)
+            self.set_memory_route(None)
             logits = self.dist_head.forward_prior(features)
             next_latent = self.flatten_sample(self.stright_throught_gradient(logits))
             image = self.image_decoder(next_latent)
@@ -372,12 +446,16 @@ class WorldModel(nn.Module):
         self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
         # context
         context_latent = self.encode_obs(sample_obs)
+        obs_route = self._obs_route
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
                 context_latent[:, i:i+1],
                 sample_action[:, i:i+1],
-                log_video=log_video
+                log_video=log_video,
+                route=None if obs_route is None else obs_route[:, i:i+1],
             )
+        # Imagined tokens keep the context of the rollout's last observed frame.
+        self._rollout_context = None if obs_route is None else obs_route[:, -1:]
         self.latent_buffer[:, 0:1] = last_latent
         self.hidden_buffer[:, 0:1] = last_dist_feat
 
@@ -396,6 +474,7 @@ class WorldModel(nn.Module):
             if log_video:
                 obs_hat_list.append(last_obs_hat[::imagine_batch_size//16])  # uniform sample vec_env
 
+        self._rollout_context = None
         if log_video:
             logger.log("Imagine/predict_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy(), step=step)
 
@@ -448,7 +527,10 @@ class WorldModel(nn.Module):
 
             # transformer
             temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
+            if self._routing_live():
+                self.set_memory_route(self._observed_route(embedding))
             dist_feat = self.storm_transformer(flattened_sample, action, temporal_mask)
+            self.set_memory_route(None)
             if backbone:
                 prior_logits = self.dist_head.forward_prior(dist_feat)
             # decoding reward and termination with dist_feat
