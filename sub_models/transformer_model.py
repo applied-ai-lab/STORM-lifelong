@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat, rearrange
 
-from sub_models.attention_blocks import get_vector_mask
 from sub_models.attention_blocks import PositionalEncoding1D, AttentionBlock, AttentionBlockKVCache
 
 
@@ -86,9 +85,11 @@ class StochasticTransformerKVCache(nn.Module):
     def forward_with_kv_cache(self, samples, action):
         '''
         Forward pass with kv_cache, cache stored in self.kv_cache_list
+        Takes L >= 1 new tokens: each attends to the cache and to the new tokens up to itself,
+        so L tokens in one call fill the cache as L calls of one token would.
         '''
-        assert samples.shape[1] == 1
-        mask = get_vector_mask(self.kv_cache_list[0].shape[1]+1, samples.device)
+        L, cached = samples.shape[1], self.kv_cache_list[0].shape[1]
+        mask = torch.ones((1, L, cached+L), device=samples.device).tril(diagonal=cached).bool()
 
         action = F.one_hot(action.long(), self.action_dim).float()
         feats = self.stem(torch.cat([samples, action], dim=-1))
@@ -96,7 +97,12 @@ class StochasticTransformerKVCache(nn.Module):
         feats = self.layer_norm(feats)
 
         for idx, layer in enumerate(self.layer_stack):
-            self.kv_cache_list[idx] = torch.cat([self.kv_cache_list[idx], feats], dim=1)
+            # The cache keeps the dtype reset_kv_cache_list gave it (bf16 under amp) rather than
+            # being promoted to the features' float32: it feeds only the key and value projections,
+            # which autocast casts to bf16 anyway, so outputs are unchanged and the whole cache is
+            # no longer cast twice per layer per call.
+            cache = self.kv_cache_list[idx]
+            self.kv_cache_list[idx] = torch.cat([cache, feats.to(cache.dtype)], dim=1)
             feats, attn = layer(feats, self.kv_cache_list[idx], self.kv_cache_list[idx], mask)
 
         return feats

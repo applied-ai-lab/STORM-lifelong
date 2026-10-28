@@ -444,20 +444,16 @@ class WorldModel(nn.Module):
         obs_hat_list = []
 
         self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype, device=device)
-        # context
+        # context: one causal pass over all its frames fills the KV cache as feeding them
+        # one at a time would; only the last frame's prediction seeds the rollout
         context_latent = self.encode_obs(sample_obs)
         obs_route = self._obs_route
-        for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
-            last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
-                context_latent[:, i:i+1],
-                sample_action[:, i:i+1],
-                log_video=log_video,
-                route=None if obs_route is None else obs_route[:, i:i+1],
-            )
+        _, _, _, last_latent, last_dist_feat = self.predict_next(
+            context_latent, sample_action, log_video=False, route=obs_route)
         # Imagined tokens keep the context of the rollout's last observed frame.
         self._rollout_context = None if obs_route is None else obs_route[:, -1:]
-        self.latent_buffer[:, 0:1] = last_latent
-        self.hidden_buffer[:, 0:1] = last_dist_feat
+        self.latent_buffer[:, 0:1] = last_latent[:, -1:]
+        self.hidden_buffer[:, 0:1] = last_dist_feat[:, -1:]
 
         # imagine
         for i in range(imagine_batch_length):
@@ -613,6 +609,20 @@ class WorldModel(nn.Module):
         # gradient descent
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
+        # bf16 memory tables have an optimizer of their own (lifelong_wm/sr_adam.py), stepped alongside.
+        # The scaler's CUDA unscale kernel has no bf16 version, so their gradients are unscaled here
+        # (the scale is a power of two: exact) and their step skipped on a non-finite gradient, as the
+        # scaler would; none exists before the first row is placed.
+        row_optimizer = getattr(self, "row_optimizer", None)
+        row_grads = ([p.grad for g in row_optimizer.param_groups for p in g["params"] if p.grad is not None]
+                     if row_optimizer is not None else [])
+        row_step = False
+        if row_grads:
+            if self.scaler.is_enabled():
+                inv = 1.0 / float(self.scaler.get_scale())
+                for g in row_grads:
+                    g.mul_(inv)
+            row_step = bool(torch.stack([torch.isfinite(g).all() for g in row_grads]).all())
 
         # Baseline method: PackNet
         if self.packnet_enabled and self.packnet is not None:
@@ -620,8 +630,12 @@ class WorldModel(nn.Module):
 
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
         self.scaler.step(self.optimizer)
+        if row_step:
+            row_optimizer.step()
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
+        if row_optimizer is not None:
+            row_optimizer.zero_grad(set_to_none=True)
 
         if logger is not None:
             # Categorical latent utilisation: how many of the C categories the

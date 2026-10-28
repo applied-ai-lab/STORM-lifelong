@@ -37,7 +37,7 @@ class ScaledDotProductAttention(nn.Module):
         attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
 
         if mask is not None:
-            attn = attn.masked_fill(mask == 0, -1e9)
+            attn.masked_fill_(mask == 0, -1e9)  # in place: the matmul's backward does not need its output
 
         attn = self.dropout(F.softmax(attn, dim=-1))
         output = torch.matmul(attn, v)
@@ -164,9 +164,8 @@ class PositionalEncoding1D(nn.Module):
         return feat
 
     def forward_with_position(self, feat, position):
-        assert feat.shape[1] == 1
         pos_emb = self.pos_emb(torch.arange(self.max_length, device=feat.device))
         pos_emb = repeat(pos_emb, "L D -> B L D", B=feat.shape[0])
 
-        feat = feat + pos_emb[:, position:position+1, :]
+        feat = feat + pos_emb[:, position:position+feat.shape[1], :]
         return feat
