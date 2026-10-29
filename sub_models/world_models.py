@@ -608,21 +608,29 @@ class WorldModel(nn.Module):
         """Shared single optimiser/scaler step for ordinary STORM and ER."""
         # gradient descent
         self.scaler.scale(total_loss).backward()
-        self.scaler.unscale_(self.optimizer)  # for clip grad
-        # bf16 memory tables have an optimizer of their own (lifelong_wm/sr_adam.py), stepped alongside.
-        # The scaler's CUDA unscale kernel has no bf16 version, so their gradients are unscaled here
-        # (the scale is a power of two: exact) and their step skipped on a non-finite gradient, as the
-        # scaler would; none exists before the first row is placed.
+        # bf16 memory tables have an optimizer of their own (lifelong_wm/sr_adam.py), stepped alongside;
+        # none has a gradient before the first row is placed. The scaler checks only the main
+        # optimizer's gradients for overflow, so a non-finite table gradient is handed to it as one
+        # in a main gradient: the whole step is skipped and the scale backed off, as when the tables
+        # were main parameters. (Unchecked, the scale doubles until the tables overflow, and the clip
+        # below turns their NaN norm into NaN main gradients that the scaler already passed.)
         row_optimizer = getattr(self, "row_optimizer", None)
         row_grads = ([p.grad for g in row_optimizer.param_groups for p in g["params"] if p.grad is not None]
                      if row_optimizer is not None else [])
-        row_step = False
-        if row_grads:
-            if self.scaler.is_enabled():
-                inv = 1.0 / float(self.scaler.get_scale())
-                for g in row_grads:
-                    g.mul_(inv)
-            row_step = bool(torch.stack([torch.isfinite(g).all() for g in row_grads]).all())
+        row_finite = bool(torch.stack([torch.isfinite(g).all() for g in row_grads]).all()) if row_grads else False
+        if row_grads and not row_finite and self.scaler.is_enabled():
+            main_grad = next((p.grad for g in self.optimizer.param_groups for p in g["params"]
+                              if p.grad is not None), None)
+            if main_grad is not None:
+                main_grad.fill_(float("inf"))
+        self.scaler.unscale_(self.optimizer)  # for clip grad
+        # The scaler's CUDA unscale kernel has no bf16 version, so the tables' gradients are unscaled
+        # here (the scale is a power of two: exact).
+        scaled = bool(row_grads) and self.scaler.is_enabled()
+        if scaled:
+            scale = self.scaler.get_scale()
+            for g in row_grads:
+                g.mul_(1.0 / scale)
 
         # Baseline method: PackNet
         if self.packnet_enabled and self.packnet is not None:
@@ -630,9 +638,10 @@ class WorldModel(nn.Module):
 
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
         self.scaler.step(self.optimizer)
-        if row_step:
-            row_optimizer.step()
         self.scaler.update()
+        # The tables step only when the scaler did: a backed-off scale means it skipped the step.
+        if row_finite and (not scaled or self.scaler.get_scale() >= scale):
+            row_optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         if row_optimizer is not None:
             row_optimizer.zero_grad(set_to_none=True)
@@ -653,5 +662,6 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/categorical_perplexity", categorical_perplexity.item(), step=step)
             logger.log("WorldModel/categorical_usage", categorical_usage.item(), step=step)
             logger.log("WorldModel/total_loss", total_loss.item(), step=step)
+            logger.log("WorldModel/grad_scale", self.scaler.get_scale(), step=step)
             for key, value in loss_dict.items():
                 logger.log(f"WorldModel/{key}", value.item() if torch.is_tensor(value) else value, step=step)
