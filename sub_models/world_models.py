@@ -230,10 +230,9 @@ class WorldModel(nn.Module):
         self.stoch_flattened_dim = self.stoch_dim*self.stoch_dim
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
-        # Context-row memories (set by the memory builder): before every transformer call,
+        # Context-row memories (put in by the memory builder): before every transformer call,
         # hand each memory every token's episode context -- for an observed token its own,
         # for an imagined one that of the rollout's last observed frame.
-        self.memory_routing = False
         self._obs_route = None
         self._rollout_context = None
         # Routes a caller already has for the next observed tokens (B, L, D), e.g. episode
@@ -301,7 +300,7 @@ class WorldModel(nn.Module):
         return self._routed
 
     def _routing_live(self):
-        return getattr(self, "memory_routing", False) and any(m.active for m in self._routed_memories())
+        return any(m.active for m in self._routed_memories())
 
     def set_memory_route(self, route):
         """Hand every routed memory its route for the next transformer call (None clears it)."""
