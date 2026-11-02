@@ -230,16 +230,10 @@ class WorldModel(nn.Module):
         self.stoch_flattened_dim = self.stoch_dim*self.stoch_dim
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
-        # What the model consumes from a posterior or prior wherever it would draw a sample
-        # (transformer input, decoder input, agent input, imagination): "sample" = STORM's
-        # straight-through one-hot sample; "probs" = the class probabilities themselves.
-        self.latent_input = "sample"
-        # Encoder-routed memories (set by the memory builder): before every transformer
-        # call, hand each routed memory the encoder embedding of every token's frame --
-        # the observed frame where there is one, else the frame decoded from the token.
+        # Context-row memories (set by the memory builder): before every transformer call,
+        # hand each memory every token's episode context -- for an observed token its own,
+        # for an imagined one that of the rollout's last observed frame.
         self.memory_routing = False
-        self.memory_route_kind = "frame"     # "frame" | "context" (see route_from_embedding)
-        self.memory_route_window = 16
         self._obs_route = None
         self._rollout_context = None
         # Routes a caller already has for the next observed tokens (B, L, D), e.g. episode
@@ -315,21 +309,13 @@ class WorldModel(nn.Module):
             m.route = route
 
     @torch.no_grad()
-    def frame_route(self, flattened_sample):
-        """The route of tokens with no observed frame: the encoder embedding of the decoded frame."""
-        return self.encoder(self.image_decoder(flattened_sample).clamp(0, 1)).detach()
-
-    @torch.no_grad()
     def route_from_embedding(self, embedding):
-        """Routes of observed tokens (B, L, D): the frame embedding itself ("frame"), or the
-        causal mean of the last ``memory_route_window`` frame embeddings ("context")."""
-        if getattr(self, "memory_route_kind", "frame") == "frame":
-            return embedding.detach()
+        """Routes of observed tokens (B, L, D) with no stored episode context: the running mean
+        of the frame embeddings from the start of the clip (its episode context, if the clip
+        starts an episode)."""
         x = embedding.detach().float()
-        c = torch.cat([torch.zeros_like(x[:, :1]), x.cumsum(1)], dim=1)
         t = torch.arange(1, x.shape[1] + 1, device=x.device)
-        lo = (t - self.memory_route_window).clamp_min(0)
-        return ((c[:, t] - c[:, lo]) / (t - lo).view(1, -1, 1).to(x.dtype)).to(embedding.dtype)
+        return (x.cumsum(1) / t.view(1, -1, 1).to(x.dtype)).to(embedding.dtype)
 
     def _observed_route(self, embedding):
         """Routes of observed tokens: the caller's override when it is aligned with them, else
@@ -343,10 +329,8 @@ class WorldModel(nn.Module):
         return self.route_from_embedding(embedding)
 
     def _unobserved_route(self, latent):
-        """Routes of tokens with no observed frame of their own: the decoded frame's embedding
-        ("frame"), or the context of the last observed frame, held fixed ("context")."""
-        if getattr(self, "memory_route_kind", "frame") == "frame":
-            return self.frame_route(latent)
+        """Routes of tokens with no observed frame of their own: the context of the last
+        observed frame, held fixed."""
         for ctx in (self._rollout_context, None if self._obs_route is None else self._obs_route[:, -1:]):
             if ctx is not None and ctx.shape[0] == latent.shape[0]:
                 return ctx.expand(-1, latent.shape[1], -1)
@@ -399,8 +383,6 @@ class WorldModel(nn.Module):
         return obs_hat, reward_hat, termination_hat, prior_flattened_sample, dist_feat
 
     def stright_throught_gradient(self, logits, sample_mode="random_sample"):
-        if sample_mode == "random_sample" and getattr(self, "latent_input", "sample") == "probs":
-            sample_mode = "probs"   # see latent_input in __init__
         dist = OneHotCategorical(logits=logits)
         if sample_mode == "random_sample":
             sample = dist.sample() + dist.probs - dist.probs.detach()
